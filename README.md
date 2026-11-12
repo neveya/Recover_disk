@@ -1,4 +1,4 @@
-# Disk Recover Tool
+# Disk Recover Tool (Developed by Claude.AI)
 
 NTFS · FAT12/16/32 · exFAT 디스크 이미지와 드라이브에서 **파일 목록(폴더 구조 포함)을 읽고, 삭제되었거나 손상된 파일을 다른 디스크로 복사(복구)**하는 읽기 전용 도구입니다.
 
