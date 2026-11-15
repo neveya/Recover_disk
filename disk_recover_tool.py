@@ -2384,8 +2384,952 @@ def plan_copy(items: List[tuple], sel: Selection, skip_deleted: bool, skip_damag
     return out
 
 
+# ==== VERIFY BEGIN ====
+# --------------------------------------------------------------------------
+# 파일 무결성 검증 (--verify / --verify-copy): 전체 읽기 + 형식별 구조 검사 (+ 선택: ffmpeg 디코드)
+# --------------------------------------------------------------------------
+VCFG: Dict[str, Optional[str]] = {"ffmpeg": None}
+VIDEO_EXTS = {"mp4", "m4v", "mov", "3gp", "mkv", "webm", "avi"}
+IMAGE_EXTS = {"jpg", "jpeg", "png"}
+VERIFY_EXTS = VIDEO_EXTS | IMAGE_EXTS
+_ZB = b"\x00" * 4096
+
+
+class VResult:
+    """level: 0 정상, 1 의심, 2 손상. issues 는 사람이 읽는 문장(맨 앞이 '(참고)' 이면 판정에 영향 없음)."""
+
+    def __init__(self):
+        self.level = 0
+        self.issues: List[str] = []
+
+    def add(self, lvl: int, msg: str):
+        self.level = max(self.level, lvl)
+        self.issues.append(msg if lvl else "(참고) " + msg)
+
+    @property
+    def label(self) -> str:
+        return {0: "정상", 1: "의심", 2: "손상"}[self.level]
+
+
+def _off(n: int) -> str:
+    return f"{n:,}바이트 지점({fmt_size(n)})"
+
+
+def _scan_content(path: str, size: int, res: VResult, strict: bool, cb=None) -> None:
+    """파일 전체를 읽는다: 읽기 오류, 0 으로만 채워진 구간(4 KiB 이상)을 찾는다."""
+    try:
+        f = open(winpath(path), "rb")
+    except OSError as ex:
+        res.add(2, f"파일을 열 수 없음: {ex}")
+        return
+    runs: List[Tuple[int, int]] = []           # (시작 오프셋, 길이)
+    run_start = -1
+    errs = 0
+    pos = 0
+    with f:
+        while pos < size:
+            n = min(1 << 20, size - pos)
+            try:
+                f.seek(pos)
+                buf = f.read(n)
+            except OSError as ex:
+                errs += 1
+                if errs <= 3:
+                    res.add(2, f"읽기 오류: {_off(pos)} 부근 ({ex})")
+                pos += n
+                if errs > 20:
+                    res.add(2, "읽기 오류가 너무 많아 검사를 중단함")
+                    break
+                continue
+            if not buf:
+                res.add(2, f"기록된 크기({fmt_size(size)})보다 짧게 읽힘: {_off(pos)}에서 끝남")
+                break
+            if cb:
+                cb(len(buf))
+            if _ZB in buf:
+                for i in range(len(buf) // 4096):
+                    zero = buf[i * 4096:(i + 1) * 4096] == _ZB
+                    if zero and run_start < 0:
+                        run_start = pos + i * 4096
+                    elif not zero and run_start >= 0:
+                        runs.append((run_start, pos + i * 4096 - run_start))
+                        run_start = -1
+                # 청크 끝이 4 KiB 로 나누어떨어지지 않으면(파일 끝) 남은 부분은 아래 꼬리 검사에서 확인
+                if len(buf) % 4096 and run_start >= 0:
+                    runs.append((run_start, pos + (len(buf) // 4096) * 4096 - run_start))
+                    run_start = -1
+            elif run_start >= 0:
+                runs.append((run_start, pos - run_start))
+                run_start = -1
+            pos += len(buf)
+        if run_start >= 0:
+            runs.append((run_start, pos - run_start))
+        tail_zero = False
+        if size >= 4096:
+            try:
+                f.seek(size - 4096)
+                tail_zero = f.read(4096) == _ZB
+            except OSError:
+                pass
+    total = sum(r[1] for r in runs)
+    if not runs:
+        return
+    first = runs[0][0]
+    desc = f"0으로만 채워진 구간 {len(runs)}곳(합계 {fmt_size(total)}), 첫 위치 {_off(first)}"
+    if not strict:
+        res.add(0, desc + " (이 형식은 정상일 수도 있음)")
+    elif tail_zero:
+        res.add(2, "파일 끝부분이 0으로 채워져 있음(뒷부분 유실 가능): " + desc)
+    elif total >= 256 * 1024 or max(r[1] for r in runs) >= 64 * 1024:
+        res.add(2, "내용 중간이 0으로 채워진 큰 구간이 있음(내용 유실): " + desc)
+    else:
+        res.add(1, desc)
+
+
+def _boxes(buf, start: int, end: int):
+    p = start
+    while p + 8 <= end:
+        sz = int.from_bytes(buf[p:p + 4], "big")
+        t = bytes(buf[p + 4:p + 8])
+        h = 8
+        if sz == 1:
+            if p + 16 > end:
+                return
+            sz = int.from_bytes(buf[p + 8:p + 16], "big")
+            h = 16
+        elif sz == 0:
+            sz = end - p
+        if sz < h or p + sz > end:
+            return
+        yield t, p + h, p + sz
+        p += sz
+
+
+def _mp4_tables(moov: bytes, size: int) -> dict:
+    st = {"tracks": 0, "offsets": 0, "bad_off": 0, "short": 0, "sample_bytes": 0}
+
+    def walk(s: int, e: int):
+        for t, a, b in _boxes(moov, s, e):
+            if t == b"trak":
+                st["tracks"] += 1
+                walk(a, b)
+            elif t in (b"moov", b"mdia", b"minf", b"stbl"):
+                walk(a, b)
+            elif t in (b"stco", b"co64"):
+                w = 4 if t == b"stco" else 8
+                cnt = int.from_bytes(moov[a + 4:a + 8], "big")
+                have = max(0, (b - a - 8) // w)
+                if have < cnt:
+                    st["short"] += 1
+                n = min(cnt, have)
+                if n:
+                    offs = struct.unpack_from(">%d%s" % (n, "I" if w == 4 else "Q"), moov, a + 8)
+                    st["offsets"] += n
+                    st["bad_off"] += sum(1 for o in offs if o >= size)
+            elif t == b"stsz":
+                ssz = int.from_bytes(moov[a + 4:a + 8], "big")
+                cnt = int.from_bytes(moov[a + 8:a + 12], "big")
+                if ssz:
+                    st["sample_bytes"] += ssz * cnt
+                else:
+                    have = max(0, (b - a - 12) // 4)
+                    if have < cnt:
+                        st["short"] += 1
+                    n = min(cnt, have)
+                    if n:
+                        st["sample_bytes"] += sum(struct.unpack_from(">%dI" % n, moov, a + 12))
+    walk(0, len(moov))
+    return st
+
+
+def _check_mp4(path: str, size: int, res: VResult, ext: str) -> None:
+    seen: List[bytes] = []
+    mdat_payload = 0
+    moov_buf = None
+    pos = 0
+    with open(winpath(path), "rb") as f:
+        while pos < size:
+            if size - pos < 8:
+                res.add(1, f"파일 끝에 해석할 수 없는 {size - pos}바이트가 남음")
+                break
+            f.seek(pos)
+            h = f.read(16)
+            sz = int.from_bytes(h[:4], "big")
+            typ = h[4:8]
+            hdr = 8
+            if sz == 1:
+                sz = int.from_bytes(h[8:16], "big")
+                hdr = 16
+            elif sz == 0:
+                sz = size - pos
+            if sz < hdr or not all(32 <= c < 127 for c in typ):
+                res.add(2, f"박스 구조가 깨짐: {_off(pos)}에서 올바른 박스를 찾을 수 없음(이후 내용이 다른 데이터로 바뀌었거나 손상)")
+                break
+            name = typ.decode("latin-1")
+            if pos + sz > size:
+                res.add(2, f"'{name}' 박스가 파일 끝을 넘음(파일이 잘림): 필요 {fmt_size(pos + sz)} / 실제 {fmt_size(size)}")
+                seen.append(typ)
+                break
+            seen.append(typ)
+            if typ == b"mdat":
+                mdat_payload += sz - hdr
+            elif typ == b"moov" and sz <= 256 * 1024 * 1024:
+                f.seek(pos)
+                moov_buf = f.read(sz)
+            pos += sz
+    if seen and seen[0] != b"ftyp" and ext in ("mp4", "m4v", "3gp"):
+        res.add(1, "맨 앞에 ftyp 박스가 없음")
+    if b"moov" not in seen:
+        res.add(2, "moov(재생 정보) 박스가 없음 - 재생이 안 되거나 앞부분만 재생될 수 있음")
+    if b"mdat" not in seen:
+        res.add(2, "mdat(영상 데이터) 박스가 없음")
+    if moov_buf:
+        try:
+            st = _mp4_tables(moov_buf, size)
+            if st["tracks"] == 0:
+                res.add(2, "moov 안에 트랙 정보가 없음")
+            if st["short"]:
+                res.add(2, "moov 의 샘플 표가 중간에 잘려 있음")
+            if st["bad_off"]:
+                res.add(2, f"샘플 위치 {st['bad_off']:,}개가 파일 범위({fmt_size(size)})를 벗어남(영상 뒷부분 유실)")
+            if mdat_payload and st["sample_bytes"] > mdat_payload:
+                res.add(2, f"재생 정보가 가리키는 영상 데이터({fmt_size(st['sample_bytes'])})가 실제 mdat({fmt_size(mdat_payload)})보다 큼(뒷부분 유실)")
+        except (struct.error, IndexError, ValueError):
+            res.add(1, "moov 구조를 끝까지 해석하지 못함")
+
+
+_EBML_TOP = {0x114D9B74: "SeekHead", 0x1549A966: "Info", 0x1654AE6B: "Tracks", 0x1F43B675: "Cluster", 0x1C53BB6B: "Cues",
+             0x1254C367: "Tags", 0x1043A770: "Chapters", 0x1941A469: "Attachments", 0xEC: "Void", 0xBF: "CRC-32"}
+
+
+def _ebml_read(buf: bytes, p: int, is_id: bool):
+    """(값, 길이, 알 수 없는 크기 여부) 또는 None. is_id 면 길이 표지 비트를 유지한다."""
+    if p >= len(buf):
+        return None
+    b0 = buf[p]
+    if b0 == 0:
+        return None
+    ln = 9 - b0.bit_length()
+    if ln > (4 if is_id else 8) or p + ln > len(buf):
+        return None
+    v = int.from_bytes(buf[p:p + ln], "big")
+    if is_id:
+        return v, ln, False
+    v &= (1 << (7 * ln)) - 1
+    return v, ln, v == (1 << (7 * ln)) - 1
+
+
+def _check_mkv(path: str, size: int, res: VResult) -> None:
+    clusters = 0
+    names = set()
+    with open(winpath(path), "rb") as f:
+        head = f.read(64)
+        if head[:4] != b"\x1a\x45\xdf\xa3":
+            res.add(2, "MKV/WebM 시작 표식(EBML)이 없음")
+            return
+        i = _ebml_read(head, 0, True)
+        s = _ebml_read(head, i[1], False) if i else None
+        if not s:
+            res.add(2, "EBML 헤더가 깨짐")
+            return
+        pos = i[1] + s[1] + s[0]
+        f.seek(pos)
+        h = f.read(16)
+        i = _ebml_read(h, 0, True)
+        s = _ebml_read(h, i[1], False) if i else None
+        if not i or i[0] != 0x18538067 or not s:
+            res.add(2, "Segment 를 찾을 수 없음(EBML 헤더 뒤가 다른 데이터)")
+            return
+        seg_start = pos + i[1] + s[1]
+        seg_end = size if s[2] else seg_start + s[0]
+        if seg_end > size:
+            res.add(2, f"Segment 크기({fmt_size(seg_end - seg_start)})가 실제 파일보다 큼(뒷부분 잘림)")
+            seg_end = size
+        pos = seg_start
+        while pos < seg_end:
+            f.seek(pos)
+            h = f.read(16)
+            i = _ebml_read(h, 0, True)
+            s = _ebml_read(h, i[1], False) if i else None
+            if not i or not s:
+                res.add(2, f"요소 구조가 깨짐: {_off(pos)}에서 올바른 요소를 찾을 수 없음(이후 내용이 다른 데이터로 바뀌었거나 손상)")
+                break
+            nm = _EBML_TOP.get(i[0])
+            if nm is None:
+                res.add(1, f"알 수 없는 요소 ID 0x{i[0]:X} ({_off(pos)})")
+            if s[2]:
+                res.add(1, "크기를 알 수 없는 요소(스트리밍 녹화 파일일 수 있음)")
+                if nm == "Cluster":
+                    clusters += 1
+                break
+            end = pos + i[1] + s[1] + s[0]
+            if end > size:
+                res.add(2, f"{nm or '요소'} 가 파일 끝을 넘음(파일이 잘림): 필요 {fmt_size(end)} / 실제 {fmt_size(size)}")
+                if nm == "Cluster":
+                    clusters += 1
+                if nm:
+                    names.add(nm)
+                break
+            if nm:
+                names.add(nm)
+            if nm == "Cluster":
+                clusters += 1
+            pos = end
+    if "Tracks" not in names:
+        res.add(2, "Tracks(트랙 정보)가 없음")
+    if clusters == 0:
+        res.add(2, "영상 데이터(Cluster)가 없음")
+    if "Cues" not in names:
+        res.add(0, "Cues(탐색 색인)가 없음: 건너뛰기가 느릴 수 있으나 정상 파일에도 흔함")
+
+
+def _check_avi(path: str, size: int, res: VResult) -> None:
+    with open(winpath(path), "rb") as f:
+        h = f.read(12)
+        if h[:4] != b"RIFF" or h[8:12] != b"AVI ":
+            res.add(2, "AVI 시작 표식(RIFF/AVI)이 없음")
+            return
+        riff_end = 8 + int.from_bytes(h[4:8], "little")
+        if riff_end > size:
+            res.add(2, f"RIFF 크기({fmt_size(riff_end)})가 실제 파일({fmt_size(size)})보다 큼(뒷부분 잘림)")
+        end = min(riff_end, size)
+        pos = 12
+        seen = set()
+        while pos + 8 <= end:
+            f.seek(pos)
+            c = f.read(12)
+            cid, csz = c[:4], int.from_bytes(c[4:8], "little")
+            if not all(32 <= x < 127 for x in cid):
+                res.add(2, f"청크 구조가 깨짐: {_off(pos)}")
+                break
+            tag = c[8:12].decode("latin-1") if cid == b"LIST" else cid.decode("latin-1")
+            seen.add(tag)
+            if pos + 8 + csz > size:
+                res.add(2, f"'{tag}' 청크가 파일 끝을 넘음(파일이 잘림)")
+                break
+            pos += 8 + csz + (csz & 1)
+    for need in ("hdrl", "movi"):
+        if need not in seen:
+            res.add(2, f"'{need}' 영역이 없음")
+    if "idx1" not in seen and "movi" in seen:
+        res.add(1, "idx1(색인)이 없음: 건너뛰기가 안 되거나 재생이 불안정할 수 있음")
+
+
+def _check_png(path: str, size: int, res: VResult) -> None:
+    import zlib
+    bad_crc = 0
+    seen: List[str] = []
+    with open(winpath(path), "rb") as f:
+        if f.read(8) != b"\x89PNG\r\n\x1a\n":
+            res.add(2, "PNG 시그니처가 다름")
+            return
+        pos = 8
+        while pos < size:
+            f.seek(pos)
+            h = f.read(8)
+            if len(h) < 8:
+                res.add(2, "PNG 가 청크 중간에서 끝남(잘림)")
+                break
+            ln = int.from_bytes(h[:4], "big")
+            typ = h[4:8]
+            if not all(65 <= c <= 122 for c in typ) or pos + 12 + ln > size:
+                res.add(2, f"PNG 청크 구조가 깨지거나 잘림: {_off(pos)}")
+                break
+            data = f.read(ln)
+            crc = int.from_bytes(f.read(4), "big")
+            if zlib.crc32(typ + data) & 0xFFFFFFFF != crc:
+                bad_crc += 1
+                if bad_crc <= 3:
+                    res.add(2, f"{typ.decode('latin-1')} 청크 CRC 불일치(내용이 바뀜): {_off(pos)}")
+            seen.append(typ.decode("latin-1"))
+            pos += 12 + ln
+            if typ == b"IEND":
+                if pos < size:
+                    res.add(0, f"IEND 뒤에 {size - pos}바이트가 더 있음")
+                break
+    if bad_crc > 3:
+        res.add(2, f"CRC 불일치 청크 총 {bad_crc}개")
+    if seen and seen[0] != "IHDR":
+        res.add(2, "첫 청크가 IHDR 이 아님")
+    if "IDAT" not in seen:
+        res.add(2, "이미지 데이터(IDAT)가 없음")
+    if "IEND" not in seen:
+        res.add(2, "IEND 가 없음(파일이 잘림)")
+
+
+def _check_jpeg(path: str, size: int, res: VResult) -> None:
+    with open(winpath(path), "rb") as f:
+        data = f.read(size if size <= 256 * 1024 * 1024 else 256 * 1024 * 1024)
+    if data[:2] != b"\xff\xd8":
+        res.add(2, "JPEG 시작 표식(FFD8)이 없음")
+        return
+    p = 2
+    sos = -1
+    while p + 4 <= len(data):
+        if data[p] != 0xFF:
+            res.add(2, f"JPEG 세그먼트 구조가 깨짐: {_off(p)}")
+            return
+        m = data[p + 1]
+        if m == 0xFF:
+            p += 1
+            continue
+        if m == 0xDA:
+            sos = p
+            break
+        if 0xD0 <= m <= 0xD9 or m == 0x01:
+            p += 2
+            continue
+        p += 2 + int.from_bytes(data[p + 2:p + 4], "big")
+    if sos < 0:
+        res.add(2, "JPEG 이미지 데이터(SOS)에 도달하지 못함(잘림)")
+        return
+    if data.find(b"\xff\xd9", sos) < 0:
+        res.add(2, "JPEG 끝 표식(FFD9)이 없음(뒷부분 잘림)")
+
+
+def _pil_decode(path: str, size: int, res: VResult) -> None:
+    """Pillow 가 설치되어 있으면 이미지를 끝까지 디코드해 본다(없으면 건너뜀)."""
+    if size > 128 * 1024 * 1024:
+        return
+    try:
+        from PIL import Image, ImageFile  # type: ignore
+    except Exception:  # noqa: BLE001
+        return
+    ImageFile.LOAD_TRUNCATED_IMAGES = False
+    try:
+        with Image.open(winpath(path)) as im:
+            im.load()
+    except Exception as ex:  # noqa: BLE001
+        res.add(2, f"이미지 디코드 오류: {str(ex)[:120]}")
+
+
+def _ffmpeg_check(path: str, size: int, res: VResult) -> None:
+    import subprocess
+    ff = VCFG.get("ffmpeg")
+    if not ff:
+        return
+    timeout = 60 + size / 2e6
+    try:
+        flags = 0x08000000 if os.name == "nt" else 0
+        r = subprocess.run([ff, "-v", "error", "-xerror", "-i", winpath(path), "-f", "null", "-"],
+                           capture_output=True, timeout=timeout, creationflags=flags)
+    except subprocess.TimeoutExpired:
+        res.add(1, "ffmpeg 디코드 검사가 시간 초과로 중단됨")
+        return
+    except OSError as ex:
+        res.add(1, f"ffmpeg 를 실행할 수 없음: {ex}")
+        VCFG["ffmpeg"] = None
+        return
+    err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+    if r.returncode != 0 or err:
+        res.add(2, "ffmpeg 디코드 오류: " + " / ".join(x.strip() for x in err[:2])[:200])
+
+
+def verify_file(path: str, ext: Optional[str] = None, cb=None) -> VResult:
+    """파일 하나를 검증한다. ext 를 주면 그 확장자로 형식을 판단한다(.part 임시 파일 검사용)."""
+    res = VResult()
+    try:
+        size = os.path.getsize(winpath(path))
+    except OSError as ex:
+        res.add(2, f"파일 정보를 읽을 수 없음: {ex}")
+        return res
+    name = path
+    ext = (ext or (name.rsplit(".", 1)[-1] if "." in os.path.basename(name) else "")).lower()
+    if size == 0:
+        res.add(1, "크기가 0인 빈 파일")
+        return res
+    known = ext in VERIFY_EXTS
+    _scan_content(path, size, res, known, cb)
+    if not known:
+        return res
+    try:
+        with open(winpath(path), "rb") as f:
+            head = f.read(16)
+        if sig_check("x." + ext, head, size) == "bad" and ext in MAGIC:
+            res.add(2, f"파일 시그니처가 .{ext} 형식과 다름(다른 데이터로 덮어써졌거나 손상)")
+        elif ext in ("mp4", "m4v", "mov", "3gp"):
+            _check_mp4(path, size, res, ext)
+        elif ext in ("mkv", "webm"):
+            _check_mkv(path, size, res)
+        elif ext == "avi":
+            _check_avi(path, size, res)
+        elif ext == "png":
+            _check_png(path, size, res)
+        elif ext in ("jpg", "jpeg"):
+            _check_jpeg(path, size, res)
+        if ext in IMAGE_EXTS and res.level < 2:
+            _pil_decode(path, size, res)
+        if ext in VIDEO_EXTS and res.level < 2 and VCFG.get("ffmpeg"):
+            _ffmpeg_check(path, size, res)
+    except OSError as ex:
+        res.add(2, f"검사 중 읽기 오류: {ex}")
+    except Exception as ex:  # noqa: BLE001
+        res.add(1, f"구조 검사 중 예기치 않은 오류(이 파일은 구조 검사를 건너뜀): {ex}")
+    return res
+
+
+def write_damaged_list(path: str, title: str, groups: List[Tuple[str, List[Tuple[str, str, str]]]], header: List[str]) -> None:
+    """손상 파일 목록을 텍스트로 저장한다. groups = [(구역 제목, [(경로, 부가 설명, 사유)...])]"""
+    with open(path, "w", encoding="utf-8-sig", newline="\r\n") as f:
+        f.write(title + "\n")
+        f.write(f"생성: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        for h in header:
+            f.write(h + "\n")
+        for gtitle, items in groups:
+            f.write(f"\n{'=' * 70}\n{gtitle}: {len(items)}개\n{'=' * 70}\n")
+            if not items:
+                f.write("(없음)\n")
+            for i, (p, extra, why) in enumerate(items, 1):
+                f.write(f"{i}. {p}\n")
+                if extra:
+                    f.write(f"   {extra}\n")
+                if why:
+                    f.write(f"   사유: {why}\n")
+
+
+# ==== MANIFEST BEGIN ====
+# --------------------------------------------------------------------------
+# 손상 파일 목록(경로별 정리) / 해시 목록(--manifest, --verify-manifest)
+# --------------------------------------------------------------------------
+BULK_RATIO = 0.8        # 폴더 하위 파일의 이 비율 이상이 손상이면 '통째로 손상된 폴더'로 묶는다
+BULK_MIN = 3            # 그리고 손상 파일이 이 개수 이상일 때
+
+
+def _split_path(p: str) -> List[str]:
+    return [x for x in p.replace("\\", "/").split("/") if x != ""]
+
+
+def write_damaged_report(path: str, title: str, header: List[str],
+                         items: List[Tuple[str, str, str, str]]) -> Tuple[int, int]:
+    """손상 목록을 폴더(경로)별로 정리해 저장한다.
+    items = [(전체 경로, 판정, 부가 설명, 사유)], 판정: 정상 / 의심 / 손상 / 복사불가. 정상 파일도 넣어야 폴더별 손상 비율을 낼 수 있다.
+    반환: (통째로 손상된 폴더 수, 손상 파일 수). 일괄 처리용으로 <path>_경로목록.txt (폴더/파일 경로만 한 줄씩)도 만든다."""
+    BAD = ("손상", "복사불가")
+    root: dict = {"n": {}, "t": 0, "b": 0, "s": 0}
+
+    def node_for(parts: List[str], upto: int) -> dict:
+        cur = root
+        for x in parts[:upto]:
+            cur = cur["n"].setdefault(x, {"n": {}, "t": 0, "b": 0, "s": 0})
+        return cur
+
+    prefix = ""
+    for p, lab, ex, why in items:
+        parts = _split_path(p)
+        # 윈도우 경로 맨 앞(D: 같은 드라이브)이나 / 는 폴더로 취급하지 않고 그대로 접두에 쓴다
+        cur = root
+        cur["t"] += 1
+        cur["b"] += lab in BAD
+        cur["s"] += lab == "의심"
+        for x in parts[:-1]:
+            cur = cur["n"].setdefault(x, {"n": {}, "t": 0, "b": 0, "s": 0})
+            cur["t"] += 1
+            cur["b"] += lab in BAD
+            cur["s"] += lab == "의심"
+    lead = "/" if items and items[0][0].replace("\\", "/").startswith("/") else ""
+
+    def join(parts: List[str]) -> str:
+        return lead + "/".join(parts) if parts else (lead or "/")
+
+    bulk: List[Tuple[List[str], dict]] = []
+
+    def find_bulk(nd: dict, parts: List[str]):
+        for name in sorted(nd["n"], key=str.lower):
+            ch = nd["n"][name]
+            pp = parts + [name]
+            if ch["b"] >= BULK_MIN and ch["b"] / max(ch["t"], 1) >= BULK_RATIO:
+                bulk.append((pp, ch))
+            else:
+                find_bulk(ch, pp)
+    # 모든 파일이 공통으로 들어 있는 맨 위 폴더(예: /tmp/mt)까지는 내려가서 시작한다(그 폴더 자체도 통째 손상 후보)
+    start, spath = root, []
+    while len(start["n"]) == 1 and start["t"] == sum(c["t"] for c in start["n"].values()):
+        k = next(iter(start["n"]))
+        start, spath = start["n"][k], spath + [k]
+    if spath and start["b"] >= BULK_MIN and start["b"] / max(start["t"], 1) >= BULK_RATIO:
+        bulk.append((spath, start))
+    else:
+        find_bulk(start, spath)
+    bulk_prefix = [("/".join(p).lower() + "/") for p, _n in bulk]
+
+    def in_bulk(p: str) -> bool:
+        q = "/".join(_split_path(p)).lower() + "/"
+        return any(q.startswith(bp) for bp in bulk_prefix)
+
+    n_bad = sum(1 for _p, lab, _e, _w in items if lab in BAD)
+    n_sus = sum(1 for _p, lab, _e, _w in items if lab == "의심")
+    with open(path, "w", encoding="utf-8-sig", newline="\r\n") as f:
+        f.write(title + "\n")
+        f.write(f"생성: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        for h in header:
+            f.write(h + "\n")
+        f.write(f"\n[요약] 전체 {len(items)}개 / 손상·복사불가 {n_bad}개 / 의심 {n_sus}개\n")
+        f.write(f"       ('통째로 손상된 폴더' 기준: 하위 파일의 {int(BULK_RATIO * 100)}% 이상이 손상이고 손상 {BULK_MIN}개 이상)\n")
+
+        f.write(f"\n{'=' * 72}\n[A] 통째로 손상된 폴더 {len(bulk)}개 - 폴더 단위로 한꺼번에 처리하세요 (하위 폴더 포함)\n{'=' * 72}\n")
+        if not bulk:
+            f.write("(없음)\n")
+        for i, (pp, nd) in enumerate(sorted(bulk, key=lambda x: -x[1]["b"]), 1):
+            f.write(f"{i}. {join(pp)}\n   손상 {nd['b']} / 전체 {nd['t']}개 ({nd['b'] * 100 // max(nd['t'], 1)}%)"
+                    + (f", 의심 {nd['s']}" if nd["s"] else "") + f", 하위 폴더 {len(nd['n'])}개\n")
+
+        # [B] 그 밖의 폴더: 폴더별로 묶은 손상 파일
+        groups: Dict[str, list] = {}
+        for p, lab, ex, why in items:
+            if lab in BAD and not in_bulk(p):
+                parts = _split_path(p)
+                groups.setdefault("/".join(parts[:-1]), []).append((parts[-1] if parts else p, lab, ex, why))
+        nb = sum(len(v) for v in groups.values())
+        f.write(f"\n{'=' * 72}\n[B] 그 밖의 손상 파일 {nb}개 - 폴더별 ({len(groups)}개 폴더)\n{'=' * 72}\n")
+        if not groups:
+            f.write("(없음)\n")
+        for key in sorted(groups, key=str.lower):
+            nd = node_for(key.split("/") if key else [], len(key.split("/")) if key else 0)
+            f.write(f"\n{lead}{key}/   (이 폴더 손상 {len(groups[key])} / 하위 포함 전체 {nd['t']})\n")
+            for nm, lab, ex, why in sorted(groups[key], key=lambda x: x[0].lower()):
+                f.write(f"  - {nm}" + (f"  [{lab}]" if lab != "손상" else "") + (f"  ({ex})" if ex else "") + "\n")
+                if why:
+                    f.write(f"      사유: {why}\n")
+
+        # [C] 의심(참고)
+        sg: Dict[str, list] = {}
+        for p, lab, ex, why in items:
+            if lab == "의심":
+                parts = _split_path(p)
+                sg.setdefault("/".join(parts[:-1]), []).append((parts[-1] if parts else p, why))
+        ns = sum(len(v) for v in sg.values())
+        f.write(f"\n{'=' * 72}\n[C] 의심(참고) {ns}개 - 폴더별 ({len(sg)}개 폴더)\n{'=' * 72}\n")
+        if not sg:
+            f.write("(없음)\n")
+        for key in sorted(sg, key=str.lower):
+            f.write(f"\n{lead}{key}/   ({len(sg[key])}개)\n")
+            for nm, why in sorted(sg[key], key=lambda x: x[0].lower()):
+                f.write(f"  - {nm}" + (f"   사유: {why}" if why else "") + "\n")
+
+    raw = os.path.splitext(path)[0] + "_경로목록.txt"
+    with open(raw, "w", encoding="utf-8-sig", newline="\r\n") as f:
+        f.write("# 일괄 처리용 경로 목록 (한 줄에 경로 하나). '#' 로 시작하는 줄은 설명입니다.\n")
+        f.write("# [폴더] 통째로 손상된 폴더 - 하위 포함 전체를 처리 대상으로 볼 수 있습니다\n")
+        for pp, _nd in sorted(bulk, key=lambda x: "/".join(x[0]).lower()):
+            f.write(join(pp) + "\n")
+        f.write("# [파일] 위 폴더에 포함되지 않는 손상 파일\n")
+        for p, lab, _e, _w in sorted(items, key=lambda x: x[0].lower()):
+            if lab in BAD and not in_bulk(p):
+                f.write(p + "\n")
+    return len(bulk), n_bad
+
+
+def _hash_file(path: str, algo: str, cb=None) -> str:
+    import hashlib
+    h = hashlib.new(algo)
+    with open(winpath(path), "rb") as f:
+        while True:
+            b = f.read(4 * 1024 * 1024)
+            if not b:
+                break
+            h.update(b)
+            if cb:
+                cb(len(b))
+    return h.hexdigest()
+
+
+def _walk_files(base: str) -> List[str]:
+    out: List[str] = []
+    for dp, dn, fn in os.walk(winpath(base)):
+        dn.sort(key=str.lower)
+        for x in sorted(fn, key=str.lower):
+            full = os.path.join(dp, x)
+            out.append(full[4:] if full.startswith("\\\\?\\") else full)
+    return out
+
+
+def run_manifest(args, pt: Paint) -> int:
+    base = os.path.abspath(args.manifest)
+    if not os.path.isdir(winpath(base)):
+        print(pt.red(f"[!] 폴더가 아닙니다: {base}"))
+        return 1
+    algo = (args.hash_algo or "sha256").lower()
+    try:
+        import hashlib
+        hashlib.new(algo)
+    except ValueError:
+        print(pt.red(f"[!] 지원하지 않는 해시 알고리즘: {algo} (sha256, sha1, md5, blake2b 등)"))
+        return 1
+    files = _walk_files(base)
+    if not files:
+        print("해시를 만들 파일이 없습니다.")
+        return 1
+    total = 0
+    for p in files:
+        try:
+            total += os.path.getsize(winpath(p))
+        except OSError:
+            pass
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = args.manifest_out
+    if out and (os.path.isdir(winpath(out)) or out.endswith(("\\", "/"))):
+        os.makedirs(winpath(out), exist_ok=True)
+        out = os.path.join(out, f"해시목록_{os.path.basename(base.rstrip(os.sep)) or 'root'}_{ts}.{algo}")
+    elif not out:
+        out = os.path.join(os.getcwd(), f"해시목록_{os.path.basename(base.rstrip(os.sep)) or 'root'}_{ts}.{algo}")
+    out = os.path.abspath(out)
+    out_cmp = os.path.normcase(out)
+    if os.path.normcase(os.path.commonpath([out, base])) == os.path.normcase(base) and os.path.dirname(out) == base:
+        pass  # 대상 폴더 안에 저장하는 것은 허용하되 목록 자신은 해시 대상에서 제외한다
+    print(f"해시 목록 만들기: {len(files)}개 / {fmt_size(total)} / 알고리즘 {algo}")
+    prog = Progress(max(total, 1), "해시 계산", as_bytes=True)
+    done = [0]
+    errs: List[Tuple[str, str]] = []
+    t0 = time.monotonic()
+    with open(winpath(out), "w", encoding="utf-8", newline="\n") as f:
+        f.write("# disk_recover_tool hash manifest v1\n")
+        f.write(f"# created: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        f.write(f"# algorithm: {algo}\n")
+        f.write(f"# base: {base}\n")
+        f.write("# 형식: <해시> *<기준 폴더 기준 상대경로>   (sha256sum -c 와 호환)\n")
+        for n, p in enumerate(files, 1):
+            if os.path.normcase(os.path.abspath(p)) == out_cmp:
+                continue
+
+            def cb(k, _n=n, _p=p):
+                done[0] += k
+                prog.update(done[0], f"{_n}/{len(files)}개 {os.path.basename(_p)[:30]}")
+            before = done[0]
+            try:
+                h = _hash_file(p, algo, cb)
+            except OSError as ex:
+                errs.append((p, str(ex)))
+                continue
+            finally:
+                try:
+                    done[0] = before + os.path.getsize(winpath(p))
+                except OSError:
+                    pass
+            rel = os.path.relpath(p, base).replace("\\", "/")
+            f.write(f"{h} *{rel}\n")
+    prog.done(f"{len(files)}/{len(files)}개")
+    print("\n[해시 목록 완료]")
+    print(f"  파일 {len(files) - len(errs)}개 기록 / 읽지 못함 {len(errs)}개 / 걸린 시간 {fmt_eta(time.monotonic() - t0)}")
+    for p, ex in errs[:20]:
+        print(pt.red(f"  읽기 실패: {p} ({ex})"))
+    print(f"  해시 목록: {out}")
+    print("  * 이 파일을 파일과 별도의 안전한 곳(다른 디스크, 클라우드 등)에도 보관하세요. 나중에 --verify-manifest 로 비교합니다.")
+    return 0
+
+
+def run_verify_manifest(args, pt: Paint) -> int:
+    mf = os.path.abspath(args.verify_manifest)
+    if not os.path.isfile(winpath(mf)):
+        print(pt.red(f"[!] 해시 목록 파일을 찾을 수 없습니다: {mf}"))
+        return 1
+    algo, hbase = "sha256", None
+    entries: List[Tuple[str, str]] = []
+    with open(winpath(mf), encoding="utf-8-sig", errors="replace") as f:
+        for ln in f:
+            ln = ln.rstrip("\r\n")
+            if ln.startswith("#"):
+                if ln.startswith("# algorithm:"):
+                    algo = ln.split(":", 1)[1].strip().lower()
+                elif ln.startswith("# base:"):
+                    hbase = ln.split(":", 1)[1].strip()
+                continue
+            if not ln.strip():
+                continue
+            m = re.match(r"^([0-9a-fA-F]+)\s+\*?(.+)$", ln)
+            if m:
+                entries.append((m.group(1).lower(), m.group(2)))
+    if not entries:
+        print(pt.red("[!] 해시 목록에서 항목을 읽지 못했습니다."))
+        return 1
+    base = os.path.abspath(args.manifest_base) if args.manifest_base else (hbase if hbase and os.path.isdir(winpath(hbase)) else os.path.dirname(mf))
+    if not os.path.isdir(winpath(base)):
+        print(pt.red(f"[!] 기준 폴더가 없습니다: {base}  (--manifest-base 로 지정하세요)"))
+        return 1
+    print(f"해시 비교: 목록 {len(entries)}개 / 기준 폴더 {base} / 알고리즘 {algo}")
+    total = 0
+    for _h, rel in entries:
+        try:
+            total += os.path.getsize(winpath(os.path.join(base, *rel.split("/"))))
+        except OSError:
+            pass
+    prog = Progress(max(total, 1), "해시 비교", as_bytes=True)
+    done = [0]
+    t0 = time.monotonic()
+    rows: List[tuple] = []
+    items: List[Tuple[str, str, str, str]] = []
+    cnt: Counter = Counter()
+    shown = 0
+    for n, (h0, rel) in enumerate(entries, 1):
+        p = os.path.join(base, *rel.split("/"))
+        before = done[0]
+
+        def cb(k, _n=n, _r=rel):
+            done[0] += k
+            prog.update(done[0], f"{_n}/{len(entries)}개 {os.path.basename(_r)[:30]}")
+        status, why = "정상", ""
+        if not os.path.exists(winpath(p)):
+            status, why = "없음", "목록에는 있으나 파일이 없음(삭제·이동됨)"
+        else:
+            try:
+                h1 = _hash_file(p, algo, cb)
+                if h1 != h0:
+                    status = "변경"
+                    why = "해시가 달라짐(내용이 바뀌었거나 손상)"
+                    vr = verify_file(p)
+                    if vr.issues:
+                        why += " | " + " | ".join(x for x in vr.issues if not x.startswith("(참고)")) if any(not x.startswith("(참고)") for x in vr.issues) else ""
+                    else:
+                        why += " | 구조 검사로는 이상이 보이지 않음(미세한 내용 변경일 수 있음)"
+            except OSError as ex:
+                status, why = "읽기실패", f"파일을 읽을 수 없음: {ex}"
+        try:
+            done[0] = before + os.path.getsize(winpath(p))
+        except OSError:
+            done[0] = before
+        cnt[status] += 1
+        full = p
+        rows.append((full, rel, status, why))
+        lab = "정상" if status == "정상" else ("의심" if status == "없음" else "손상")
+        items.append((full, lab, f"상태: {status}", why))
+        if status != "정상" and shown < 100:
+            shown += 1
+            sys.stderr.write("\r" + " " * 100 + "\r")
+            print(fit(pt.bad(f"  [{status}] {full}" + (f"  - {why[:80]}" if why else ""))), flush=True)
+            if shown == 100:
+                print("  (이후 문제 파일은 화면에 표시하지 않고 보고서에만 기록합니다)")
+        prog.update(done[0], f"{n}/{len(entries)}개")
+    prog.done(f"{len(entries)}/{len(entries)}개")
+    listed = {os.path.normcase(os.path.abspath(os.path.join(base, *rel.split("/")))) for _h, rel in entries}
+    extra_new = [p for p in _walk_files(base)
+                 if os.path.normcase(os.path.abspath(p)) not in listed and os.path.normcase(os.path.abspath(p)) != os.path.normcase(mf)]
+    out_dir = os.path.abspath(args.verify_out or os.getcwd())
+    os.makedirs(winpath(out_dir), exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(out_dir, f"해시비교결과_{ts}.csv")
+    txt_path = os.path.join(out_dir, f"손상파일목록_{ts}.txt")
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["경로", "상대경로", "상태", "내용"])
+        w.writerows(rows)
+        for p in extra_new:
+            w.writerow([p, os.path.relpath(p, base), "목록에 없음", "해시 목록을 만든 뒤 새로 생긴 파일"])
+    nb, nbad = write_damaged_report(txt_path, "해시 비교 결과 - 손상/변경 파일 목록",
+                                    [f"해시 목록: {mf}", f"기준 폴더: {base}",
+                                     f"목록 {len(entries)}개 / 정상 {cnt['정상']} / 변경 {cnt['변경']} / 없음 {cnt['없음']} / 읽기실패 {cnt['읽기실패']} / 목록에 없는 새 파일 {len(extra_new)}"],
+                                    items)
+    print("\n[해시 비교 결과]")
+    print(f"  걸린 시간 {fmt_eta(time.monotonic() - t0)} / 목록 {len(entries)}개 / 정상 {cnt['정상']} / "
+          + pt.bad(f"변경 {cnt['변경']}") + " / " + pt.sus(f"없음 {cnt['없음']}") + " / " + pt.bad(f"읽기실패 {cnt['읽기실패']}")
+          + f" / 목록에 없는 새 파일 {len(extra_new)}")
+    if nbad:
+        print(f"  통째로 손상된 폴더 {nb}개 포함, 손상 파일 정리본: {txt_path}")
+    print(f"  손상 파일 목록(폴더별): {txt_path}")
+    print(f"  일괄 처리용 경로 목록: {os.path.splitext(txt_path)[0]}_경로목록.txt")
+    print(f"  전체 결과(CSV): {csv_path}")
+    return 0
+
+
+# ==== MANIFEST END ====
+
+
+def run_verify(args, pt: Paint) -> int:
+    target = os.path.abspath(args.verify)
+    if not os.path.exists(winpath(target)):
+        print(pt.red(f"[!] 경로를 찾을 수 없습니다: {target}"))
+        return 1
+    if args.ffmpeg:
+        ff = shutil.which(args.ffmpeg) if args.ffmpeg else None
+        if ff:
+            VCFG["ffmpeg"] = ff
+            print(f"ffmpeg 디코드 검사 사용: {ff}")
+        else:
+            print(pt.yel(f"[!] ffmpeg 를 찾을 수 없어 디코드 검사는 생략합니다 ({args.ffmpeg}). 경로를 --ffmpeg 뒤에 적거나 PATH 에 추가하세요."))
+    files: List[str] = []
+    skipped = 0
+    if os.path.isfile(winpath(target)):
+        files = [target]
+    else:
+        for dp, dn, fn in os.walk(winpath(target)):
+            dn.sort(key=str.lower)
+            for x in sorted(fn, key=str.lower):
+                full = os.path.join(dp, x)
+                if full.startswith("\\\\?\\"):
+                    full = full[4:]
+                e_ = x.rsplit(".", 1)[-1].lower() if "." in x else ""
+                if args.verify_all or e_ in VERIFY_EXTS:
+                    files.append(full)
+                else:
+                    skipped += 1
+    if not files:
+        print("검사할 파일이 없습니다." + (" (지원 형식: mp4/m4v/mov/3gp/mkv/webm/avi/jpg/png — 다른 형식도 읽기 검사를 하려면 --verify-all)" if skipped else ""))
+        return 1
+    total = 0
+    for p in files:
+        try:
+            total += os.path.getsize(winpath(p))
+        except OSError:
+            pass
+    print(f"검사 대상 {len(files)}개 / {fmt_size(total)}" + (f" (지원하지 않는 형식 {skipped}개는 제외, 포함하려면 --verify-all)" if skipped else ""))
+    prog = Progress(max(total, 1), "무결성 검사", as_bytes=True)
+    done = [0]
+    t0 = time.monotonic()
+    rows: List[tuple] = []
+    cnt: Counter = Counter()
+    shown = 0
+    base = target if os.path.isdir(winpath(target)) else os.path.dirname(target)
+    for n, p in enumerate(files, 1):
+        def cb(k, _n=n, _p=p):
+            done[0] += k
+            prog.update(done[0], f"{_n}/{len(files)}개 {os.path.basename(_p)[:30]}")
+        before = done[0]
+        r = verify_file(p, cb=cb)
+        try:
+            sz = os.path.getsize(winpath(p))
+        except OSError:
+            sz = 0
+        done[0] = before + sz            # 읽기 오류 등으로 덜 읽었어도 진행률은 파일 크기만큼 진행
+        cnt[r.label] += 1
+        notes = [x for x in r.issues if not x.startswith("(참고)")]
+        rel = os.path.relpath(p, base) if os.path.isdir(winpath(target)) else os.path.basename(p)
+        rows.append((p, rel, sz, r.label, " | ".join(r.issues)))
+        if r.level and shown < 100:
+            shown += 1
+            sys.stderr.write("\r" + " " * 100 + "\r")
+            line = f"  [{r.label}] {p}" + (f"  - {notes[0]}" if notes else "")
+            print(fit(pt.bad(line) if r.level == 2 else pt.sus(line)), flush=True)
+            if shown == 100:
+                print("  (이후 문제 파일은 화면에 표시하지 않고 보고서에만 기록합니다)")
+        prog.update(done[0], f"{n}/{len(files)}개")
+    prog.done(f"{len(files)}/{len(files)}개")
+    out_dir = os.path.abspath(args.verify_out or os.getcwd())
+    os.makedirs(winpath(out_dir), exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(out_dir, f"검증결과_{ts}.csv")
+    txt_path = os.path.join(out_dir, f"손상파일목록_{ts}.txt")
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["경로", "상대경로", "크기", "판정", "내용"])
+        w.writerows(rows)
+    items = [(p, lab, f"크기 {fmt_size(sz)}", " | ".join(x for x in iss.split(" | ") if x and not x.startswith("(참고)")))
+             for p, _rel, sz, lab, iss in rows]
+    nbulk, _nb = write_damaged_report(txt_path, "손상 파일 목록 (무결성 검사)",
+                                      [f"검사 대상: {target}", f"검사 파일 {len(files)}개 / {fmt_size(total)} / 걸린 시간 {fmt_eta(time.monotonic() - t0)}"], items)
+    print("\n[검사 결과]")
+    print(f"  걸린 시간 {fmt_eta(time.monotonic() - t0)} / 전체 {len(files)}개 / 정상 {cnt['정상']} / "
+          + pt.sus(f"의심 {cnt['의심']}") + " / " + pt.bad(f"손상 {cnt['손상']}"))
+    print("  * '정상'은 읽기 오류·0 채움·구조 이상이 발견되지 않았다는 뜻이며, 실제 재생이 문제없음을 보장하지는 않습니다"
+          + ("" if VCFG.get("ffmpeg") else " (영상은 --ffmpeg 로 끝까지 디코드해 보면 더 정확합니다)."))
+    print(f"  손상 파일 목록(폴더별 정리): {txt_path}" + (f"  [통째로 손상된 폴더 {nbulk}개]" if nbulk else ""))
+    print(f"  일괄 처리용 경로 목록: {os.path.splitext(txt_path)[0]}_경로목록.txt")
+    print(f"  전체 결과(CSV): {csv_path}")
+    return 0
+
+
+# ==== VERIFY END ====
+
+
 def run_copy(img, vol, boot, st_mft, plan: List[tuple], dest: str, tag_damaged: bool, overwrite: bool,
-             force: bool, report_path: str, pt: Paint) -> int:
+             force: bool, report_path: str, pt: Paint, verify_after: bool = False) -> int:
     if not plan:
         print("복사할 파일이 없습니다(선택 결과가 비어 있음).")
         return 1
@@ -2447,6 +3391,14 @@ def run_copy(img, vol, boot, st_mft, plan: List[tuple], dest: str, tag_damaged: 
                 notes.append("복사한 내용의 앞부분이 확장자 시그니처와 다르거나 0으로 채워져 있음")
             if res.errs:
                 final_risk = 2
+            if verify_after and res.status in ("ok", "partial"):
+                vr = verify_file(tmp, ext=base_name.rsplit(".", 1)[-1] if "." in base_name else "")
+                for m_ in vr.issues:
+                    notes.append("검증: " + m_)
+                if vr.level == 2:
+                    final_risk = 2
+                elif vr.level == 1:
+                    final_risk = max(final_risk, 1)
             final = RISK_LABEL[final_risk]
             name = tag_name(base_name, DMG_TAG) if (tag_damaged and final_risk >= 2) else base_name
             rel = f"{folder_rel}/{name}" if folder_rel else name
@@ -2512,6 +3464,27 @@ def run_copy(img, vol, boot, st_mft, plan: List[tuple], dest: str, tag_damaged: 
             fs = folder_stat[k]
             w.writerow(["/" + k, *fs, "노랑(손상 파일 포함)" if fs[1] else ""])
 
+    # 손상 파일 목록을 폴더(경로)별로 정리해 따로 저장 + 일괄 처리용 경로 목록
+    dpath = os.path.splitext(report_path)[0] + "_손상파일목록.txt"
+    items_ = []
+    g_dmg, g_fail = [], []
+    for r_ in rows_out:
+        src, outp_, result_, final_, deleted_, size_, written_, _sig, rec_, memo_ = r_
+        lab_ = "복사불가" if result_ == "복사불가" else {"손상추정": "손상", "의심": "의심"}.get(final_, "정상")
+        extra_ = (f"저장 위치: {outp_}" if outp_ else "저장 안 됨") + f" / 크기 {fmt_size(size_)}" + (" / 삭제된 파일" if deleted_ == "삭제" else "")
+        items_.append((src, lab_, extra_, memo_))
+        if lab_ == "손상":
+            g_dmg.append(src)
+        elif lab_ == "복사불가":
+            g_fail.append(src)
+    n_bulk = 0
+    try:
+        n_bulk, _nb = write_damaged_report(dpath, "손상 파일 목록 (복사한 파일 기준)",
+                                           [f"저장 위치: {dest}", f"복사 대상 {len(plan)}개",
+                                            "※ '손상추정'은 메타데이터/위치 분석에 근거한 추정이며 실제 내용은 열어서 확인해야 합니다."], items_)
+    except OSError as ex_:
+        dpath = f"(저장 실패: {ex_})"
+
     print("\n[복사 결과]")
     print(f"  걸린 시간 {fmt_eta(time.monotonic() - t_start)} / 복사 용량 {fmt_size(done_bytes)}")
     tot = len(plan)
@@ -2531,6 +3504,11 @@ def run_copy(img, vol, boot, st_mft, plan: List[tuple], dest: str, tag_damaged: 
             print(f"    ... 외 {len(yel) - 15}개 폴더 (보고서 참고)")
     print(f"  보고서: {os.path.abspath(report_path)}")
     print(f"  폴더별 표시: {os.path.abspath(fpath)}")
+    print(f"  손상 파일 목록(폴더별 정리): {os.path.abspath(dpath)}" + (pt.red(f"  [손상추정 {len(g_dmg)} / 복사불가 {len(g_fail)}" + (f" / 통째로 손상된 폴더 {n_bulk}" if n_bulk else "") + "]") if (g_dmg or g_fail) else " (손상추정·복사불가 없음)"))
+    if g_dmg or g_fail:
+        print(f"  일괄 처리용 경로 목록: {os.path.splitext(os.path.abspath(dpath))[0]}_경로목록.txt")
+    if not verify_after:
+        print("  * 복사본 내용 검사: --verify-copy 로 복사하거나, 복사 후 --verify \"저장폴더\" 로 검사할 수 있습니다(영상은 --ffmpeg 추가).")
     return 0
 
 
@@ -4200,7 +5178,7 @@ def tree_and_copy(args, img, vol, boot, st_mft, rows, visible, pt) -> Optional[i
                 rep = os.path.join(dest_abs, os.path.basename(rep))
             print(f"\n[복사 #{run_no}] 선택 {len(sel.dirs)}개 폴더 / {len(sel.files)}개 파일 / 제외 {len(sel.excl)}개 -> 대상 파일 {len(plan)}개"
                   f" (--gen {args.gen}" + (", 삭제 제외" if args.skip_deleted else "") + (", 손상추정 제외" if args.skip_damaged else "") + ")")
-            rc = run_copy(img, vol, boot, st_mft, plan, dest_cur, not args.no_tag, args.overwrite, args.force, rep, pt)
+            rc = run_copy(img, vol, boot, st_mft, plan, dest_cur, not args.no_tag, args.overwrite, args.force, rep, pt, args.verify_copy)
             if not args.browse:
                 return rc
             sel.dirs.clear(); sel.files.clear(); sel.excl.clear()
@@ -4242,6 +5220,17 @@ def main(argv=None):
     ap.add_argument("--all", action="store_true", help="$MFT 등 시스템 메타파일도 표시")
     ap.add_argument("--deleted-only", action="store_true", help="삭제된 항목만 표시")
     ap.add_argument("--only-issues", action="store_true", help="의심/손상추정 항목만 표시")
+    ap.add_argument("--verify", metavar="경로", help="디스크가 아니라 파일/폴더의 무결성을 검사(전체 읽기 + mp4/mkv/avi/jpg/png 구조 검사). 결과 목록과 손상 파일 목록을 저장")
+    ap.add_argument("--manifest", metavar="폴더", help="폴더 안 모든 파일의 해시 목록을 만든다(나중에 --verify-manifest 로 변경·손상 여부를 비교)")
+    ap.add_argument("--manifest-out", metavar="파일|폴더", help="--manifest 로 만든 목록 파일의 저장 위치(기본: 현재 폴더)")
+    ap.add_argument("--hash-algo", default="sha256", metavar="이름", help="해시 알고리즘(기본 sha256; sha1, md5, blake2b 등)")
+    ap.add_argument("--verify-manifest", metavar="목록파일", help="해시 목록과 현재 파일을 비교해 변경·손상·누락 파일을 찾는다(결과는 --verify-out 에 저장)")
+    ap.add_argument("--manifest-base", metavar="폴더", help="--verify-manifest 의 기준 폴더(기본: 목록에 적힌 폴더, 없으면 목록 파일이 있는 폴더)")
+    ap.add_argument("--verify-all", action="store_true", help="--verify 에서 지원하지 않는 형식의 파일도 읽기 검사에 포함")
+    ap.add_argument("--verify-out", metavar="폴더", help="--verify 보고서를 저장할 폴더(기본: 현재 폴더)")
+    ap.add_argument("--verify-copy", action="store_true", help="복사한 파일을 복사 직후 같은 방식으로 검사해 판정에 반영(복사 시간이 늘어남)")
+    ap.add_argument("--ffmpeg", nargs="?", const="ffmpeg", default=None, metavar="경로",
+                    help="영상 검사에 ffmpeg 로 끝까지 디코드해 보기(PATH 의 ffmpeg 또는 지정한 경로). 느리지만 재생 문제를 가장 잘 잡음")
     ap.add_argument("--check-data", action="store_true", help="각 파일의 시작 부분을 읽어 확장자 시그니처와 대조(느릴 수 있음)")
     ap.add_argument("--no-probe", action="store_true", help="선언된 $MFT 끝 뒤 영역 탐사를 생략")
     ap.add_argument("--gen", choices=["current", "old", "all"], default="current",
@@ -4272,6 +5261,16 @@ def main(argv=None):
     pt = Paint(enable_color(args.no_color))
     if args.list_drives:
         return list_drives()
+    if args.ffmpeg and not args.verify:
+        VCFG["ffmpeg"] = shutil.which(args.ffmpeg)
+        if not VCFG["ffmpeg"]:
+            print(pt.yel(f"[!] ffmpeg 를 찾을 수 없어 디코드 검사는 생략합니다 ({args.ffmpeg})"))
+    if args.manifest:
+        return run_manifest(args, pt)
+    if args.verify_manifest:
+        return run_verify_manifest(args, pt)
+    if args.verify:
+        return run_verify(args, pt)
     if args.drive is not None:
         args.image = f"\\\\.\\PhysicalDrive{args.drive}"
     if not args.image:
@@ -4951,6 +5950,8 @@ def launcher_loop() -> int:
         print("  - 드라이브 문자       예) E:")
         print("  - 물리 디스크 번호    예) 1          (= \\\\.\\PhysicalDrive1)")
         print("  - 이미지 파일 경로    예) D:\\backup\\disk.001   (파일을 이 창에 끌어다 놓아도 됩니다)")
+        print("  - 일반 폴더 경로      예) D:\\복구결과   (무결성 검사 / 해시 목록 만들기·비교)")
+        print("  - 해시 목록 파일      예) D:\\해시목록.sha256   (현재 파일과 비교)")
         print("  - L = 연결된 디스크/볼륨 목록 보기      Q 또는 exit = 종료\n")
         try:
             src = input("대상: ").strip().strip('"')
@@ -4976,6 +5977,55 @@ def launcher_loop() -> int:
             except (EOFError, KeyboardInterrupt):
                 return 0
             if ans == "y" and relaunch_as_admin():
+                return 0
+            continue
+        is_mf = (not is_dev) and os.path.isfile(src) and src.lower().endswith((".sha256", ".sha1", ".md5", ".blake2b", ".sha512"))
+        as_verify = (not is_dev) and (os.path.isdir(src) or is_mf)
+        if as_verify:
+            if is_mf:
+                mode = "3"
+            else:
+                print(f"\n[폴더] {src}\n  1) 파일 무결성 검사 (mp4/mkv/avi/jpg/png 구조·0 채움·읽기 오류)\n  2) 해시 목록 만들기 (나중에 변경·손상 여부를 비교)\n  3) 해시 목록과 비교")
+                try:
+                    mode = input("번호(기본 1): ").strip() or "1"
+                except (EOFError, KeyboardInterrupt):
+                    return 0
+            extra = []
+            if mode == "2":
+                av = ["--manifest", src]
+                hint = "  옵션 예) --manifest-out D:\\해시목록   --hash-algo md5"
+            elif mode == "3":
+                if is_mf:
+                    mfile = src
+                else:
+                    try:
+                        mfile = input("해시 목록 파일 경로: ").strip().strip('"')
+                    except (EOFError, KeyboardInterrupt):
+                        return 0
+                av = ["--verify-manifest", mfile] + ([] if is_mf else ["--manifest-base", src])
+                hint = "  옵션 예) --verify-out D:\\결과   --manifest-base D:\\폴더"
+            else:
+                av = ["--verify", src]
+                hint = "  옵션 예) --ffmpeg (영상을 끝까지 디코드, ffmpeg 필요)   --verify-all (다른 형식도 읽기 검사)   --verify-out D:\\결과"
+            print(hint)
+            try:
+                opt = input("옵션(없으면 Enter): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return 0
+            extra = [x.strip('"') for x in shlex.split(opt, posix=False)] if opt else []
+            try:
+                main(av + extra)
+            except SystemExit:
+                pass
+            except KeyboardInterrupt:
+                print("\n중단되었습니다.")
+            except Exception:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+            try:
+                if input("\n다른 대상을 다시 지정할까요? (Y/N): ").strip().lower() != "y":
+                    return 0
+            except (EOFError, KeyboardInterrupt):
                 return 0
             continue
         if not is_dev and not os.path.exists(src):
